@@ -65,6 +65,24 @@ struct memory_stat {
 	uint64_t total_unevictable;
 };
 
+#undef max
+#undef min
+
+static inline uint64_t max(uint64_t a, uint64_t b)
+{
+	return a > b ? a : b;
+}
+
+static inline uint64_t min(uint64_t a, uint64_t b)
+{
+	return a < b ? a : b;
+}
+
+static inline uint64_t saturating_sub(uint64_t a, uint64_t b)
+{
+	return a < b ? 0 : a - b;
+}
+
 static off_t get_procfile_size(const char *path)
 {
 	__do_fclose FILE *f = NULL;
@@ -317,10 +335,10 @@ static char *gnu_dirname(char *path)
  * @returns 0 on success, < 0 on error
  */
 static int get_min_memlimit(const char *cgroup, bool want_swap,
-			    struct metrics *mem, struct metrics *swap,
-			    uint64_t *memswpriority)
+			    struct metrics *mem, struct metrics *swap)
 {
 	__do_free char *memswpriority_str = NULL;
+	uint64_t  memswpriority = 1;
 	int ret;
 
 	ret = cgroup_ops->get_memory_hier_metrics(cgroup_ops, cgroup, mem);
@@ -328,7 +346,6 @@ static int get_min_memlimit(const char *cgroup, bool want_swap,
 		return ret;
 
 	*swap = (struct metrics) { 0 };
-	*memswpriority = 1;
 	if (!want_swap)
 		return 0;
 
@@ -342,24 +359,16 @@ static int get_min_memlimit(const char *cgroup, bool want_swap,
 	// memory.swappiness only exists in v1
 	ret = cgroup_ops->get_memory_swappiness(cgroup_ops, cgroup, &memswpriority_str);
 	if (ret >= 0)
-		safe_uint64(memswpriority_str, memswpriority, 10);
+		safe_uint64(memswpriority_str, &memswpriority, 10);
 
 	// swap is actually memsw in v1. Necessarily, must have mem <= memsw.
-	if (mem->effective_limit > swap->effective_limit)
-		mem->effective_limit = swap->effective_limit;
-
-	if (mem->usage > swap->usage)
-		swap->usage = 0;
-	else
-		swap->usage -= mem->usage;
-
-	if (mem->usage_at_limit_cgroup > swap->usage_at_limit_cgroup)
-		swap->usage = 0;
-	else
-		swap->usage -= mem->usage;
+	mem->effective_limit =  min(mem->effective_limit,  swap->effective_limit);
+	// For usage, but not limits, sw = memsw - mem
+	swap->usage = saturating_sub(swap->usage, mem->usage);
+	swap->usage_at_limit_cgroup = saturating_sub(swap->usage_at_limit_cgroup, mem->usage_at_limit_cgroup);
 
 	/* When swappiness is 0, pretend we can't swap. */
-	if (*memswpriority == 0)
+	if (memswpriority == 0)
 		swap->effective_limit = swap->usage_at_limit_cgroup;
 
 	return 0;
@@ -377,7 +386,7 @@ static int proc_swaps_read(char *buf, size_t size, off_t offset,
 	struct fuse_context *fc = fuse_get_context();
 	bool wants_swap = lxcfs_has_opt(fuse_get_context()->private_data, LXCFS_SWAP_ON);
 	struct file_info *d = INTTYPE_TO_PTR(fi->fh);
-	uint64_t memswpriority = 1, hostswtotal = 0, hostswfree = 0;
+	uint64_t hostswtotal = 0, hostswfree = 0;
 	struct metrics mem = new_metrics(), swap = new_metrics();
 	ssize_t total_len = 0;
 	ssize_t l = 0;
@@ -413,7 +422,7 @@ static int proc_swaps_read(char *buf, size_t size, off_t offset,
 		return read_file_fuse("/proc/swaps", buf, size, d);
 	prune_init_slice(cgroup);
 
-	ret = get_min_memlimit(cgroup, wants_swap, &mem, &swap, &memswpriority);
+	ret = get_min_memlimit(cgroup, wants_swap, &mem, &swap);
 	if (ret < 0)
 		return 0;
 
@@ -433,12 +442,7 @@ static int proc_swaps_read(char *buf, size_t size, off_t offset,
 			sscanf(line, "SwapFree:      %8" PRIu64 " kB", &hostswfree);
 	}
 
-	if (wants_swap) {
-		if (hostswtotal < swap.effective_limit) {
-			swap.effective_limit = hostswtotal;
-		}
-	}
-
+	swap.effective_limit = min(swap.effective_limit, hostswtotal);
 	if (swap.effective_limit > 0) {
 		l = snprintf(d->buf + total_len, d->size - total_len,
 			     "none%*svirtual\t\t%" PRIu64 "\t%" PRIu64 "\t0\n",
@@ -1236,10 +1240,8 @@ static int proc_meminfo_read(char *buf, size_t size, off_t offset,
 	struct fuse_context *fc = fuse_get_context();
 	bool wants_swap = lxcfs_has_opt(fuse_get_context()->private_data, LXCFS_SWAP_ON);
 	struct file_info *d = INTTYPE_TO_PTR(fi->fh);
-	struct metrics mem;
-	uint64_t hosttotal = 0, hostfree = 0, hostswtotal = 0, hostswfree = 0;
-	uint64_t free = 0, swfree = 0, memswpriority = 1;
-	struct metrics swap = new_metrics();
+	uint64_t free = 0;
+	struct metrics mem = new_metrics(), swap = new_metrics();
 	struct memory_stat mstat = {};
 	size_t linelen = 0, total_len = 0;
 	char *cache = d->buf;
@@ -1273,7 +1275,7 @@ static int proc_meminfo_read(char *buf, size_t size, off_t offset,
 	prune_init_slice(cgroup);
 
 	/* memory limits */
-	ret = get_min_memlimit(cgroup, wants_swap, &mem, &swap, &memswpriority);
+	ret = get_min_memlimit(cgroup, wants_swap, &mem, &swap);
 	if (ret < 0)
 		return read_file_fuse("/proc/meminfo", buf, size, d);
 
@@ -1292,47 +1294,38 @@ static int proc_meminfo_read(char *buf, size_t size, off_t offset,
 
 		memset(lbuf, 0, 100);
 		if (startswith(line, "MemTotal:")) {
+			uint64_t hosttotal = 0;
 			sscanf(line+sizeof("MemTotal:")-1, "%" PRIu64, &hosttotal);
-			if (hosttotal < mem.effective_limit)
-				mem.effective_limit = hosttotal;
+			mem.effective_limit = min(mem.effective_limit, hosttotal);
 			snprintf(lbuf, 100, "MemTotal:       %8" PRIu64 " kB\n", mem.effective_limit);
 			printme = lbuf;
 		} else if (startswith(line, "MemFree:")) {
-			if (mem.effective_limit < mem.usage_at_limit_cgroup)
-				free = 0;
-			else
-				free = mem.effective_limit - mem.usage_at_limit_cgroup;
-
+			uint64_t hostfree = 0;
 			sscanf(line+sizeof("MemFree:")-1, "%" PRIu64, &hostfree);
-			if (hostfree < free) {
-				free = hostfree;
-			}
+			free = saturating_sub(mem.effective_limit, mem.usage_at_limit_cgroup);
+			free = min(free, hostfree);
 			snprintf(lbuf, 100, "MemFree:        %8" PRIu64 " kB\n", free);
 			printme = lbuf;
 		} else if (startswith(line, "MemAvailable:")) {
-			snprintf(lbuf, 100, "MemAvailable:   %8" PRIu64 " kB\n", free +
-				(mstat.total_active_file + mstat.total_inactive_file) / 1024);
+			uint64_t avail = free + (mstat.total_active_file + mstat.total_inactive_file) / 1024;
+			avail = min(avail, mem.effective_limit);
+			snprintf(lbuf, 100, "MemAvailable:   %8" PRIu64 " kB\n", avail);
 			printme = lbuf;
 		} else if (startswith(line, "SwapTotal:")) {
 			if (wants_swap) {
+				uint64_t hostswtotal = 0;
 				sscanf(line + STRLITERALLEN("SwapTotal:"), "%" PRIu64, &hostswtotal);
-				if (hostswtotal < swap.effective_limit)
-					swap.effective_limit = hostswtotal;
+				swap.effective_limit = min(swap.effective_limit, hostswtotal);
 			}
 
 			snprintf(lbuf, 100, "SwapTotal:      %8" PRIu64 " kB\n", swap.effective_limit);
 			printme = lbuf;
 		} else if (startswith(line, "SwapFree:")) {
+			uint64_t hostswfree = 0, swfree = 0;
 			if (wants_swap) {
-				if (swap.effective_limit < swap.usage_at_limit_cgroup)
-					swfree = 0;
-				else
-					swfree = swap.effective_limit - swap.usage_at_limit_cgroup;
-
 				sscanf(line + STRLITERALLEN("SwapFree:"), "%" PRIu64, &hostswfree);
-				if (hostswfree < swfree) {
-					swfree = hostswfree;
-				}
+				swfree = saturating_sub(swap.effective_limit, swap.usage_at_limit_cgroup);
+				swfree = min(swfree, hostswfree);
 			}
 
 			snprintf(lbuf, 100, "SwapFree:       %8" PRIu64 " kB\n", swfree);
