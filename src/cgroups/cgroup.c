@@ -21,6 +21,7 @@
 #include <sys/types.h>
 #include <sys/vfs.h>
 #include <unistd.h>
+#include <inttypes.h>
 
 #include "../macro.h"
 #include "../memory_utils.h"

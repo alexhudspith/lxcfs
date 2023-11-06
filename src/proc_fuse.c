@@ -309,6 +309,9 @@ static int get_min_memlimit(const char *cgroup, bool want_swap,
 	if (memswpriority == 0)
 		swap->effective_limit = swap->usage_at_limit_cgroup;
 
+	debug_metrics("Memory_1", mem);
+	debug_metrics("Swap_1", swap);
+
 	return 0;
 }
 
@@ -1226,6 +1229,9 @@ static int proc_meminfo_read(char *buf, size_t size, off_t offset,
 
 	divide_metrics(&mem, 1024);
 	divide_metrics(&swap, 1024);
+	debug_metrics("Memory account = ", &mem);
+	debug_metrics("Swap account = ", &swap);
+
 	while (getline(&line, &linelen, f) != -1) {
 		ssize_t l;
 		char *printme, lbuf[100];

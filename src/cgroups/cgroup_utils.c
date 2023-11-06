@@ -858,6 +858,12 @@ int cgroup_walkup_to_root(int hierarchy_fd, const char *cgroup_rel,
 	int res;
 	struct metrics tmp_metrics = new_metrics();
 
+#ifdef DEBUG
+	__do_free char *path = strdup(cgroup_rel);
+	if (path != NULL) {
+		lxcfs_debug("%s", path);
+	}
+#endif
 	/* Open the lowest level, starting cgroup directory */
 	dir_fd = openat(hierarchy_fd, cgroup_rel, O_DIRECTORY | O_PATH | O_CLOEXEC);
 	if (dir_fd < 0)
@@ -880,7 +886,12 @@ int cgroup_walkup_to_root(int hierarchy_fd, const char *cgroup_rel,
 	 */
 	for (int i = 0; i < 1000; i++) {
 		__do_close int inner_fd = -EBADF;
-
+#ifdef DEBUG
+		if (path != NULL) {
+			path = gnu_dirname(path);
+			lxcfs_debug("%s", path);
+		}
+#endif
 		inner_fd = move_fd(dir_fd);
 		dir_fd = openat(inner_fd, "..", O_DIRECTORY | O_PATH | O_CLOEXEC);
 		if (dir_fd < 0)

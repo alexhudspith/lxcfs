@@ -94,6 +94,19 @@ static inline void divide_metrics(struct metrics *metrics, uint divisor) {
 	}
 }
 
+static inline void debug_metrics(const char *prefix, struct metrics *metrics) {
+	lxcfs_debug(
+		"\n%s"
+		"\n\tusage: %" PRIu64
+		"\n\tusage_at_limit_cgroup: %" PRIu64
+		"\n\teffective_limit: %" PRIu64,
+		prefix,
+		metrics->usage,
+		metrics->usage_at_limit_cgroup,
+		metrics->effective_limit
+	);
+}
+
 struct cgroup_ops {
 	/*
 	 * File descriptor of the mount namespace the cgroup hierarchies are
