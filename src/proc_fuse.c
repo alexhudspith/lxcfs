@@ -239,40 +239,6 @@ __lxcfs_fuse_ops int proc_release(const char *path, struct fuse_file_info *fi)
 	return 0;
 }
 
-/**
- * Gets a non-hierarchical memory controller limit, or UINT64_MAX if no limit is
- * in place.
- * @param cgroup name of cgroup
- * @param swap request swap (v2)/memsw (v1) limit, not RAM
- * @param limit output limit set on success, unmodified on failure
- * @returns 0 on success (and sets `*limit`), < 0 on error
- */
-static int get_memlimit(const char *cgroup, bool swap, uint64_t *limit)
-{
-	__do_free char *memlimit_str = NULL;
-	uint64_t memlimit = UINT64_MAX;
-	int ret;
-
-	if (swap)
-		ret = cgroup_ops->get_memory_swap_max(cgroup_ops, cgroup, &memlimit_str);
-	else
-		ret = cgroup_ops->get_memory_max(cgroup_ops, cgroup, &memlimit_str);
-
-	if (ret < 0)
-		return ret;
-
-	if (memlimit_str[0]) {
-		ret = safe_uint64(memlimit_str, &memlimit, 10);
-		if (ret < 0) {
-			lxcfs_error("Failed to convert memory%s.max=%s for cgroup %s",
-				    swap ? ".swap" : "", memlimit_str, cgroup);
-			return ret;
-		}
-	}
-	*limit = memlimit;
-	return 0;
-}
-
 /*
  * This function taken from glibc-2.32, as POSIX dirname("/some-dir") will
  * return "/some-dir" as opposed to "/", which breaks `get_min_memlimit()`
@@ -336,43 +302,66 @@ static char *gnu_dirname(char *path)
 }
 
 /**
- * Gets a hierarchical memory controller limit, or UINT64_MAX if no limit is
- * in place. The limit is the minimum of all limits in the cgroup hierarchy.
- * @param cgroup name of cgroup
- * @param swap request swap (v2)/memsw (v1) limit, not RAM
- * @param limit output limit set on success, unmodified on failure
- * @returns 0 on success (and sets `*limit`), < 0 on error
+ * Gets the RAM/swap usage and hierarchical limits for the given cgroup.
+ * For cgroups v1, the returned swap usage will be accurate (memsw - mem), but
+ * limits can only be bounded by mem <= memsw.
+ *
+ * This function return success even if swap (or memsw) information can't
+ * be read, because swap accounting may be turned off in the kernel. In this
+ * case it behaves as if `want_swap` is false.
+ *
+ * @param cgroup the cgroup to query for
+ * @param want_swap `true` to also query swap info; `false` will set swap fields to 0
+ * @param mem out values for RAM
+ * @param swap out values for swap
+ * @returns 0 on success, < 0 on error
  */
-static int get_min_memlimit(const char *cgroup, bool swap, uint64_t *limit)
+static int get_min_memlimit(const char *cgroup, bool want_swap,
+			    struct metrics *mem, struct metrics *swap,
+			    uint64_t *memswpriority)
 {
-	__do_free char *copy = NULL;
-	uint64_t memlimit = UINT64_MAX, retlimit = UINT64_MAX;
+	__do_free char *memswpriority_str = NULL;
 	int ret;
 
-	copy = strdup(cgroup);
-	if (!copy)
-		return log_error_errno(0, ENOMEM, "Failed to allocate memory");
-
-	ret = get_memlimit(copy, swap, &retlimit);
+	ret = cgroup_ops->get_memory_hier_metrics(cgroup_ops, cgroup, mem);
 	if (ret < 0)
 		return ret;
 
-	/*
-	 * If the cgroup doesn't start with / (probably won't happen), dirname()
-	 * will terminate with "" instead of "/"
-	 */
-	while (retlimit != 0 && *copy && strcmp(copy, "/") != 0) {
-		char *it = copy;
+	*swap = (struct metrics) { 0 };
+	*memswpriority = 1;
+	if (!want_swap)
+		return 0;
 
-		it = gnu_dirname(it);
-		ret = get_memlimit(it, swap, &memlimit);
-		if (ret < 0)
-			return ret;
-		if (memlimit < retlimit)
-			retlimit = memlimit;
+	ret = cgroup_ops->get_memory_swap_hier_metrics(cgroup_ops, cgroup, swap);
+	if (ret < 0 || liblxcfs_memory_is_cgroupv2()) {
+		// No error if swap accounting is turned off
+		// Also v2 has separate mem/swap and needs no further treatment
+		return 0;
 	}
 
-	*limit = retlimit;
+	// memory.swappiness only exists in v1
+	ret = cgroup_ops->get_memory_swappiness(cgroup_ops, cgroup, &memswpriority_str);
+	if (ret >= 0)
+		safe_uint64(memswpriority_str, memswpriority, 10);
+
+	// swap is actually memsw in v1. Necessarily, must have mem <= memsw.
+	if (mem->effective_limit > swap->effective_limit)
+		mem->effective_limit = swap->effective_limit;
+
+	if (mem->usage > swap->usage)
+		swap->usage = 0;
+	else
+		swap->usage -= mem->usage;
+
+	if (mem->usage_at_limit_cgroup > swap->usage_at_limit_cgroup)
+		swap->usage = 0;
+	else
+		swap->usage -= mem->usage;
+
+	/* When swappiness is 0, pretend we can't swap. */
+	if (*memswpriority == 0)
+		swap->effective_limit = swap->usage_at_limit_cgroup;
+
 	return 0;
 }
 
@@ -381,54 +370,15 @@ static inline bool startswith(const char *line, const char *pref)
 	return strncmp(line, pref, strlen(pref)) == 0;
 }
 
-static void get_swap_info(const char *cgroup, uint64_t memlimit,
-			  uint64_t memusage, uint64_t *swtotal,
-			  uint64_t *swusage, uint64_t *memswpriority)
-{
-	__do_free char *memswusage_str = NULL, *memswpriority_str = NULL;
-	uint64_t memswlimit = 0, memswusage = 0;
-	int ret;
-
-	*swtotal = *swusage = 0;
-	*memswpriority = 1;
-
-	ret = get_min_memlimit(cgroup, true, &memswlimit);
-	if (ret < 0)
-		return;
-	ret = cgroup_ops->get_memory_swap_current(cgroup_ops, cgroup, &memswusage_str);
-	if (ret < 0 || safe_uint64(memswusage_str, &memswusage, 10) < 0)
-		return;
-
-	if (liblxcfs_memory_is_cgroupv2()) {
-		*swtotal = memswlimit / 1024;
-		*swusage = memswusage / 1024;
-	} else {
-		if (memlimit > memswlimit)
-			*swtotal = 0;
-		else
-			*swtotal = (memswlimit - memlimit) / 1024;
-		if (memusage > memswusage || *swtotal == 0)
-			*swusage = 0;
-		else
-			*swusage = (memswusage - memusage) / 1024;
-	}
-
-	ret = cgroup_ops->get_memory_swappiness(cgroup_ops, cgroup, &memswpriority_str);
-	if (ret >= 0)
-		safe_uint64(memswpriority_str, memswpriority, 10);
-}
-
 static int proc_swaps_read(char *buf, size_t size, off_t offset,
 			   struct fuse_file_info *fi)
 {
-	__do_free char *cgroup = NULL, *memusage_str = NULL,
-		 *memswusage_str = NULL, *memswpriority_str = NULL;
+	__do_free char *cgroup = NULL;
 	struct fuse_context *fc = fuse_get_context();
 	bool wants_swap = lxcfs_has_opt(fuse_get_context()->private_data, LXCFS_SWAP_ON);
 	struct file_info *d = INTTYPE_TO_PTR(fi->fh);
-	uint64_t memlimit = 0, memusage = 0,
-		 swtotal = 0, swusage = 0, memswpriority = 1,
-		 hostswtotal = 0, hostswfree = 0;
+	uint64_t memswpriority = 1, hostswtotal = 0, hostswfree = 0;
+	struct metrics mem = new_metrics(), swap = new_metrics();
 	ssize_t total_len = 0;
 	ssize_t l = 0;
 	char *cache = d->buf;
@@ -463,17 +413,9 @@ static int proc_swaps_read(char *buf, size_t size, off_t offset,
 		return read_file_fuse("/proc/swaps", buf, size, d);
 	prune_init_slice(cgroup);
 
-	ret = get_min_memlimit(cgroup, false, &memlimit);
+	ret = get_min_memlimit(cgroup, wants_swap, &mem, &swap, &memswpriority);
 	if (ret < 0)
 		return 0;
-	ret = cgroup_ops->get_memory_current(cgroup_ops, cgroup, &memusage_str);
-	if (ret < 0)
-		return 0;
-	if (safe_uint64(memusage_str, &memusage, 10) < 0)
-		lxcfs_error("Failed to convert memusage %s", memusage_str);
-
-	if (wants_swap)
-		get_swap_info(cgroup, memlimit, memusage, &swtotal, &swusage, &memswpriority);
 
 	total_len = snprintf(d->buf, d->size, "Filename\t\t\t\tType\t\tSize\tUsed\tPriority\n");
 
@@ -482,6 +424,8 @@ static int proc_swaps_read(char *buf, size_t size, off_t offset,
 	if (!f)
 		return 0;
 
+	divide_metrics(&mem, 1024);
+	divide_metrics(&swap, 1024);
 	while (getline(&line, &linelen, f) != -1) {
 		if (startswith(line, "SwapTotal:"))
 			sscanf(line, "SwapTotal:      %8" PRIu64 " kB", &hostswtotal);
@@ -490,27 +434,15 @@ static int proc_swaps_read(char *buf, size_t size, off_t offset,
 	}
 
 	if (wants_swap) {
-		/* For cgroups v1, the total amount of swap is always reported to be the
-		   lesser of the RAM+SWAP limit or the SWAP device size.
-		   This is because the kernel can swap as much as it
-		   wants and not only up to swtotal. */
-		if (!liblxcfs_memory_is_cgroupv2())
-			swtotal = memlimit / 1024 + swtotal;
-
-		if (hostswtotal < swtotal) {
-			swtotal = hostswtotal;
-		}
-
-		/* When swappiness is 0, pretend we can't swap. */
-		if (memswpriority == 0) {
-			swtotal = swusage;
+		if (hostswtotal < swap.effective_limit) {
+			swap.effective_limit = hostswtotal;
 		}
 	}
 
-	if (swtotal > 0) {
+	if (swap.effective_limit > 0) {
 		l = snprintf(d->buf + total_len, d->size - total_len,
 			     "none%*svirtual\t\t%" PRIu64 "\t%" PRIu64 "\t0\n",
-			     36, " ", swtotal, swusage);
+			     36, " ", swap.effective_limit, swap.usage_at_limit_cgroup);
 		total_len += l;
 	}
 
@@ -1298,16 +1230,16 @@ static bool cgroup_parse_memory_stat(const char *cgroup, struct memory_stat *mst
 static int proc_meminfo_read(char *buf, size_t size, off_t offset,
 			     struct fuse_file_info *fi)
 {
-	__do_free char *cgroup = NULL, *line = NULL, *memusage_str = NULL,
-		       *memswusage_str = NULL, *memswpriority_str = NULL;
+	__do_free char *cgroup = NULL, *line = NULL;
 	__do_free void *fopen_cache = NULL;
 	__do_fclose FILE *f = NULL;
 	struct fuse_context *fc = fuse_get_context();
 	bool wants_swap = lxcfs_has_opt(fuse_get_context()->private_data, LXCFS_SWAP_ON);
 	struct file_info *d = INTTYPE_TO_PTR(fi->fh);
-	uint64_t memlimit = 0, memusage = 0,
-		 hosttotal = 0, swfree = 0, swusage = 0, swtotal = 0,
-		 memswpriority = 1;
+	struct metrics mem;
+	uint64_t hosttotal = 0, hostfree = 0, hostswtotal = 0, hostswfree = 0;
+	uint64_t free = 0, swfree = 0, memswpriority = 1;
+	struct metrics swap = new_metrics();
 	struct memory_stat mstat = {};
 	size_t linelen = 0, total_len = 0;
 	char *cache = d->buf;
@@ -1341,32 +1273,19 @@ static int proc_meminfo_read(char *buf, size_t size, off_t offset,
 	prune_init_slice(cgroup);
 
 	/* memory limits */
-	ret = cgroup_ops->get_memory_current(cgroup_ops, cgroup, &memusage_str);
+	ret = get_min_memlimit(cgroup, wants_swap, &mem, &swap, &memswpriority);
 	if (ret < 0)
 		return read_file_fuse("/proc/meminfo", buf, size, d);
-
-	if (safe_uint64(memusage_str, &memusage, 10) < 0)
-		lxcfs_error("Failed to convert memusage %s", memusage_str);
 
 	if (!cgroup_parse_memory_stat(cgroup, &mstat))
 		return read_file_fuse("/proc/meminfo", buf, size, d);
-
-	ret = get_min_memlimit(cgroup, false, &memlimit);
-	if (ret < 0)
-		return read_file_fuse("/proc/meminfo", buf, size, d);
-	/*
-	 * Following values are allowed to fail, because swapaccount might be
-	 * turned off for current kernel.
-	 */
-	if (wants_swap)
-		get_swap_info(cgroup, memlimit, memusage, &swtotal, &swusage, &memswpriority);
 
 	f = fopen_cached("/proc/meminfo", "re", &fopen_cache);
 	if (!f)
 		return read_file_fuse("/proc/meminfo", buf, size, d);
 
-	memusage /= 1024;
-	memlimit /= 1024;
+	divide_metrics(&mem, 1024);
+	divide_metrics(&swap, 1024);
 	while (getline(&line, &linelen, f) != -1) {
 		ssize_t l;
 		char *printme, lbuf[100];
@@ -1374,47 +1293,46 @@ static int proc_meminfo_read(char *buf, size_t size, off_t offset,
 		memset(lbuf, 0, 100);
 		if (startswith(line, "MemTotal:")) {
 			sscanf(line+sizeof("MemTotal:")-1, "%" PRIu64, &hosttotal);
-			if (memlimit == 0)
-				memlimit = hosttotal;
-
-			if (hosttotal < memlimit)
-				memlimit = hosttotal;
-			snprintf(lbuf, 100, "MemTotal:       %8" PRIu64 " kB\n", memlimit);
+			if (hosttotal < mem.effective_limit)
+				mem.effective_limit = hosttotal;
+			snprintf(lbuf, 100, "MemTotal:       %8" PRIu64 " kB\n", mem.effective_limit);
 			printme = lbuf;
 		} else if (startswith(line, "MemFree:")) {
-			snprintf(lbuf, 100, "MemFree:        %8" PRIu64 " kB\n", memlimit - memusage);
+			if (mem.effective_limit < mem.usage_at_limit_cgroup)
+				free = 0;
+			else
+				free = mem.effective_limit - mem.usage_at_limit_cgroup;
+
+			sscanf(line+sizeof("MemFree:")-1, "%" PRIu64, &hostfree);
+			if (hostfree < free) {
+				free = hostfree;
+			}
+			snprintf(lbuf, 100, "MemFree:        %8" PRIu64 " kB\n", free);
 			printme = lbuf;
 		} else if (startswith(line, "MemAvailable:")) {
-			snprintf(lbuf, 100, "MemAvailable:   %8" PRIu64 " kB\n", memlimit - memusage + (mstat.total_active_file + mstat.total_inactive_file) / 1024);
+			snprintf(lbuf, 100, "MemAvailable:   %8" PRIu64 " kB\n", free +
+				(mstat.total_active_file + mstat.total_inactive_file) / 1024);
 			printme = lbuf;
 		} else if (startswith(line, "SwapTotal:")) {
 			if (wants_swap) {
-				uint64_t hostswtotal = 0;
-
 				sscanf(line + STRLITERALLEN("SwapTotal:"), "%" PRIu64, &hostswtotal);
-
-				/* In cgroups v1, the total amount of swap is always reported to be the
-				   lesser of the RAM+SWAP limit or the SWAP device size.
-				   This is because the kernel can swap as much as it
-				   wants and not only up to swtotal. */
-				if (!liblxcfs_memory_is_cgroupv2())
-					swtotal += memlimit;
-
-				if (hostswtotal < swtotal) {
-					swtotal = hostswtotal;
-				}
-
-				/* When swappiness is 0, pretend we can't swap. */
-				if (memswpriority == 0) {
-					swtotal = swusage;
-				}
+				if (hostswtotal < swap.effective_limit)
+					swap.effective_limit = hostswtotal;
 			}
 
-			snprintf(lbuf, 100, "SwapTotal:      %8" PRIu64 " kB\n", swtotal);
+			snprintf(lbuf, 100, "SwapTotal:      %8" PRIu64 " kB\n", swap.effective_limit);
 			printme = lbuf;
 		} else if (startswith(line, "SwapFree:")) {
 			if (wants_swap) {
-				swfree = swtotal - swusage;
+				if (swap.effective_limit < swap.usage_at_limit_cgroup)
+					swfree = 0;
+				else
+					swfree = swap.effective_limit - swap.usage_at_limit_cgroup;
+
+				sscanf(line + STRLITERALLEN("SwapFree:"), "%" PRIu64, &hostswfree);
+				if (hostswfree < swfree) {
+					swfree = hostswfree;
+				}
 			}
 
 			snprintf(lbuf, 100, "SwapFree:       %8" PRIu64 " kB\n", swfree);
