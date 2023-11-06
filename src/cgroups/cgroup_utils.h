@@ -86,9 +86,10 @@ static inline int openat_safe(int fd, const char *path)
 	return openat(fd, path, O_DIRECTORY | O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
 }
 
-extern int cgroup_walkup_to_root(int cgroup2_root_fd, int hierarchy_fd,
-				 const char *cgroup, const char *file,
-				 char **value);
+extern int cgroup_walkup_to_root(int hierarchy_fd,
+				 const char *cgroup_rel,
+				 const char *usage_file_name, const char *limit_file_name,
+				 struct metrics *value);
 
 #define must_make_path_relative(__first__, ...)                                \
 	({                                                                     \

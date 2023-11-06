@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <sys/types.h>
+#include <stdint.h>
 
 #include "../macro.h"
 #include "../memory_utils.h"
@@ -74,6 +75,24 @@ struct hierarchy {
 	unsigned int bpf_device_controller:1;
 	int fd;
 };
+
+struct metrics {
+	uint64_t usage;
+	uint64_t usage_at_limit_cgroup;
+	uint64_t effective_limit;
+};
+
+static inline struct metrics new_metrics(void) {
+	return (struct metrics) { 0, 0, UINT64_MAX };
+}
+
+static inline void divide_metrics(struct metrics *metrics, uint divisor) {
+	metrics->usage /= divisor;
+	metrics->usage_at_limit_cgroup /= divisor;
+	if (metrics->effective_limit != UINT64_MAX) {
+		metrics->effective_limit /= divisor;
+	}
+}
 
 struct cgroup_ops {
 	/*
@@ -146,6 +165,10 @@ struct cgroup_ops {
 				     char **value);
 	int (*get_memory_swap_max)(struct cgroup_ops *ops, const char *cgroup,
 				   char **value);
+	int (*get_memory_hier_metrics)(struct cgroup_ops *ops, const char *cgroup,
+				       struct metrics *value);
+	int (*get_memory_swap_hier_metrics)(struct cgroup_ops *ops, const char *cgroup,
+					    struct metrics *value);
 	int (*get_memory_slabinfo_fd)(struct cgroup_ops *ops,
 				      const char *cgroup);
 	bool (*can_use_swap)(struct cgroup_ops *ops, const char *cgroup);
@@ -211,5 +234,4 @@ static inline int get_cgroup_fd(const char *controller)
 extern char *get_pid_cgroup(pid_t pid, const char *contrl);
 
 extern char *get_cpuset(const char *cg);
-
 #endif

@@ -532,41 +532,86 @@ static bool cgfsng_get(struct cgroup_ops *ops, const char *controller,
 	return *value != NULL;
 }
 
+static const char *v2_memory_prop_to_v1(const char *file)
+{
+	if (strcmp(file, "memory.max") == 0) {
+		return "memory.limit_in_bytes";
+	} else if (strcmp(file, "memory.swap.max") == 0) {
+		return "memory.memsw.limit_in_bytes";
+	} else if (strcmp(file, "memory.swap.current") == 0) {
+		return "memory.memsw.usage_in_bytes";
+	} else if (strcmp(file, "memory.current") == 0) {
+		return "memory.usage_in_bytes";
+	}
+
+	return file;
+}
+
+/**
+ * Gets the contents of a memory controller file in the given cgroup.
+ * The `file` argument must use v2 terminology even with v1 hierarchies.
+ * v2 'swap' properties will be mapped to v1 'memsw' and so are not equivalent.
+ * `*value` will be:
+ *   empty string on error including if no file is found;
+ *   the file contents otherwise
+ *
+ * @param ops cgroup hierarchy info and functions
+ * @param cgroup cgroup name
+ * @param file file name in cgroup from which to read, in v2 terms
+ * @param value return argument to store value read from file
+ * @returns `-errno` on error, positive cgroup magic number on success
+ */
 static int cgfsng_get_memory(struct cgroup_ops *ops, const char *cgroup,
 			     const char *file, char **value)
 {
-	__do_free char *path = NULL;
 	struct hierarchy *h;
-	int cgroup2_root_fd, layout, ret;
+	int layout;
+	bool ret;
 
 	h = ops->get_hierarchy(ops, "memory");
 	if (!h)
 		return -1;
 
 	if (!is_unified_hierarchy(h)) {
-		if (strcmp(file, "memory.max") == 0)
-			file = "memory.limit_in_bytes";
-		else if (strcmp(file, "memory.swap.max") == 0)
-			file = "memory.memsw.limit_in_bytes";
-		else if (strcmp(file, "memory.swap.current") == 0)
-			file = "memory.memsw.usage_in_bytes";
-		else if (strcmp(file, "memory.current") == 0)
-			file = "memory.usage_in_bytes";
+		file = v2_memory_prop_to_v1(file);
 		layout = CGROUP_SUPER_MAGIC;
-		cgroup2_root_fd = -EBADF;
 	} else {
 		layout = CGROUP2_SUPER_MAGIC;
-		cgroup2_root_fd = ops->cgroup2_root_fd;
+	}
+
+	ret = cgfsng_get(ops, "memory", cgroup, file, value);
+	if (!ret) {
+		return -errno;
+	}
+
+	return layout;
+}
+
+static int cgfsng_get_memory_hier(struct cgroup_ops *ops, const char *cgroup,
+				  const char *usage_file, const char *limit_file,
+				  struct metrics *value)
+{
+	__do_free char *path = NULL;
+	struct hierarchy *h;
+	int layout, ret;
+
+	h = ops->get_hierarchy(ops, "memory");
+	if (!h)
+		return -1;
+
+	if (!is_unified_hierarchy(h)) {
+		usage_file = v2_memory_prop_to_v1(usage_file);
+		limit_file = v2_memory_prop_to_v1(limit_file);
+		layout = CGROUP_SUPER_MAGIC;
+	} else {
+		layout = CGROUP2_SUPER_MAGIC;
 	}
 
 	path = must_make_path_relative(cgroup, NULL);
-	ret = cgroup_walkup_to_root(cgroup2_root_fd, h->fd, path, file, value);
-	if (ret < 0)
+	ret = cgroup_walkup_to_root(h->fd, path, usage_file, limit_file, value);
+	if (ret < 0) {
+		lxcfs_error("(%d): Dir walk failed for cgroup '%s'", -ret, cgroup);
 		return ret;
-	if (ret == 1) {
-		*value = strdup("");
-		if (!*value)
-			return -ENOMEM;
 	}
 
 	return layout;
@@ -615,6 +660,20 @@ static int cgfsng_get_memory_swap_max(struct cgroup_ops *ops,
 	return cgfsng_get_memory(ops, cgroup, "memory.swap.max", value);
 }
 
+static int cgfsng_get_memory_hier_metrics(struct cgroup_ops *ops,
+					  const char *cgroup, struct metrics *value)
+{
+	return cgfsng_get_memory_hier(ops, cgroup,
+				      "memory.current", "memory.max", value);
+}
+
+static int cgfsng_get_memory_swap_hier_metrics(struct cgroup_ops *ops,
+					       const char *cgroup, struct metrics *value)
+{
+	return cgfsng_get_memory_hier(ops, cgroup,
+				      "memory.swap.current", "memory.swap.max", value);
+}
+
 static int cgfsng_get_memory_slabinfo_fd(struct cgroup_ops *ops, const char *cgroup)
 {
 	__do_free char *path = NULL;
@@ -633,8 +692,9 @@ static int cgfsng_get_memory_slabinfo_fd(struct cgroup_ops *ops, const char *cgr
 
 static bool cgfsng_can_use_swap(struct cgroup_ops *ops, const char *cgroup)
 {
-	__do_free char *cgroup_rel = NULL, *junk_value = NULL;
-	const char *file;
+	__do_free char *cgroup_rel = NULL;
+	const char *usage_file, *limit_file;
+	struct metrics junk_value;
 	struct hierarchy *h;
 
 	h = ops->get_hierarchy(ops, "memory");
@@ -642,13 +702,18 @@ static bool cgfsng_can_use_swap(struct cgroup_ops *ops, const char *cgroup)
 		return false;
 
 	cgroup_rel = must_make_path_relative(cgroup, NULL);
-	file = is_unified_hierarchy(h) ? "memory.swap.current" : "memory.memsw.usage_in_bytes";
+	usage_file = "memory.swap.current";
+	limit_file = "memory.swap.max";
+	if (!is_unified_hierarchy(h)) {
+		usage_file = v2_memory_prop_to_v1(usage_file);
+		limit_file = v2_memory_prop_to_v1(limit_file);
+	}
 	/* For v2, we need to look at the lower levels of the hierarchy because
 	 * no 'memory.swap.current' file exists at the root. We must search
 	 * upwards in the hierarchy in case memory accounting is disabled via
 	 * cgroup.subtree_control for the given cgroup itself.
 	 */
-	int ret = cgroup_walkup_to_root(ops->cgroup2_root_fd, h->fd, cgroup_rel, file, &junk_value);
+	int ret = cgroup_walkup_to_root(h->fd, cgroup_rel, usage_file, limit_file, &junk_value);
 	return ret == 0;
 }
 
@@ -1008,6 +1073,8 @@ struct cgroup_ops *cgfsng_ops_init(void)
 	cgfsng_ops->get_memory_swap_max = cgfsng_get_memory_swap_max;
 	cgfsng_ops->get_memory_current = cgfsng_get_memory_current;
 	cgfsng_ops->get_memory_swap_current = cgfsng_get_memory_swap_current;
+	cgfsng_ops->get_memory_hier_metrics = cgfsng_get_memory_hier_metrics;
+	cgfsng_ops->get_memory_swap_hier_metrics = cgfsng_get_memory_swap_hier_metrics;
 	cgfsng_ops->get_memory_slabinfo_fd = cgfsng_get_memory_slabinfo_fd;
 	cgfsng_ops->can_use_swap = cgfsng_can_use_swap;
 

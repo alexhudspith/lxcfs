@@ -18,6 +18,7 @@
 #include "../memory_utils.h"
 #include "cgroup.h"
 #include "cgroup_utils.h"
+#include "../utils.h"
 
 int get_cgroup_version(char *line)
 {
@@ -727,64 +728,96 @@ static bool same_file(int fd1, int fd2)
 }
 
 /**
- * cgroup_walkup_to_root() - Walk upwards to cgroup root to find valid value
+ * Updates metrics with the usage and limit read from a single cgroup directory.
+ * Since a controller can be disabled at any level via cgroup.subtree_control,
+ * it is allowed for either file to be missing. It is an error if a file exists
+ * but can't be parsed.
  *
- * @cgroup2_root_fd:	File descriptor for the cgroup2 root mount point.
- * @hierarchy_fd:	File descriptor for the hierarchy.
- * @cgroup:		A cgroup directory relative to @hierarchy_fd.
- * @file:		The file in @cgroup from which to read a value.
- * @value:		Return argument to store value read from @file.
- *
- * This function tries to read a valid value from @file in @cgroup in
- * @hierarchy_fd. If it is a legacy cgroup hierarchy and we fail to find a
- * valid value we terminate early and report an error.
- * The cgroup2 hierarchy however, has different semantics. In a few controller
- * files it will show the value "max" or simply leave it completely empty
- * thereby indicating that no limit has been set for this particular cgroup.
- * However, that doesn't mean that there's no limit. A cgroup further up the
- * hierarchy could have a limit set that also applies to the cgroup we are
- * interested in. So for the unified cgroup hierarchy we need to keep walking
- * towards the cgroup2 root cgroup and try to parse a valid value.
- *
- * Returns: 0 if a limit was found, 1 if no limit was set or "max" was set,
- * -errno if an error occurred.
+ * @param dir_fd file descriptor for the cgroup directory
+ * @param usage_file_name usage/current file in cgroup
+ * @param limit_file_name limit/max file in cgroup
+ * @param metrics (output) metrics to update
+ * @param is_starting_cgroup `true` to also update the 'usage' field
+ * @return 0 on success (and updates `*metrics`); `-errno` if an error occurred
  */
-int cgroup_walkup_to_root(int cgroup2_root_fd, int hierarchy_fd,
-			  const char *cgroup, const char *file, char **value)
+static int update(int dir_fd,
+		  const char *usage_file_name, const char *limit_file_name,
+		  struct metrics *metrics, bool is_starting_cgroup)
+{
+	__do_free char *val = NULL;
+	uint64_t tmp_usage = 0, tmp_limit = UINT64_MAX;
+
+	val = readat_file(dir_fd, usage_file_name);
+	if (val != NULL && safe_uint64(val, &tmp_usage, 10) < 0) {
+		return log_error(-errno, "(%d): Can't parse '%s' in %s",
+				 errno, val, usage_file_name);
+	}
+
+	free_disarm(val);
+
+	val = readat_file(dir_fd, limit_file_name);
+	if (val != NULL && strcmp(val, "max") != 0 && safe_uint64(val, &tmp_limit, 10) < 0) {
+		return log_error(-errno, "(%d): Can't parse '%s' in %s",
+				 errno, val, limit_file_name);
+	}
+
+	if (is_starting_cgroup)
+		metrics->usage = tmp_usage;
+
+	if (tmp_limit < metrics->effective_limit) {
+		// More restrictive limit found, record its usage
+		metrics->effective_limit = tmp_limit;
+		metrics->usage_at_limit_cgroup = tmp_usage;
+	}
+
+	if (tmp_usage > metrics->usage_at_limit_cgroup)
+		metrics->usage_at_limit_cgroup = tmp_usage;
+
+	return 0;
+}
+
+/**
+ * Walk upwards to cgroup root, calculating the usage and effective
+ * (hierarchical) limit. The limit will be UINT64_MAX no limit applies
+ * in the hierarchy.
+ *
+ * @param hierarchy_fd file descriptor for the hierarchy
+ * @param cgroup_rel starting cgroup directory relative to hierarchy_fd
+ * @param usage_file_name usage/current file in cgroup
+ * @param limit_file_name limit/max file in cgroup
+ * @param metrics (output) metrics to set
+ * @returns 0 on success; `-errno` if an error occurred
+ */
+int cgroup_walkup_to_root(int hierarchy_fd, const char *cgroup_rel,
+			  const char *usage_file_name, const char *limit_file_name,
+			  struct metrics *metrics)
 {
 	__do_close int dir_fd = -EBADF;
-	__do_free char *val = NULL;
+	int res;
+	struct metrics tmp_metrics = new_metrics();
 
-	/* Look in our current cgroup for a valid value. */
-	dir_fd = openat(hierarchy_fd, cgroup, O_DIRECTORY | O_PATH | O_CLOEXEC);
+	/* Open the lowest level, starting cgroup directory */
+	dir_fd = openat(hierarchy_fd, cgroup_rel, O_DIRECTORY | O_PATH | O_CLOEXEC);
 	if (dir_fd < 0)
 		return -errno;
 
-	val = readat_file(dir_fd, file);
-	if (!is_empty_string(val) && strcmp(val, "max") != 0) {
-		*value = move_ptr(val);
+	res = update(dir_fd, usage_file_name, limit_file_name, &tmp_metrics, true);
+	if (res < 0)
+		return res;
+
+	if (same_file(hierarchy_fd, dir_fd)) {
+		*metrics = tmp_metrics;
 		return 0;
 	}
 
 	/*
-	 * Legacy cgroup hierarchies should always show a valid value in the
-	 * file of the cgroup. So no need to do this upwards walking crap.
-	 */
-	if (cgroup2_root_fd < 0)
-		return -EINVAL;
-	else if (same_file(cgroup2_root_fd, dir_fd))
-		return 1;
-
-	free_disarm(val);
-	/*
-	 * Set an arbitraty hard-coded limit to prevent us from ending
+	 * Set an arbitrarily hard-coded limit to prevent us from ending
 	 * up in an endless loop. There really shouldn't be any cgroup
 	 * tree that is 1000 levels deep. That would be insane in
 	 * principal and performance-wise.
 	 */
 	for (int i = 0; i < 1000; i++) {
 		__do_close int inner_fd = -EBADF;
-		__do_free char *new_val = NULL;
 
 		inner_fd = move_fd(dir_fd);
 		dir_fd = openat(inner_fd, "..", O_DIRECTORY | O_PATH | O_CLOEXEC);
@@ -792,24 +825,20 @@ int cgroup_walkup_to_root(int cgroup2_root_fd, int hierarchy_fd,
 			return -errno;
 
 		/*
-		 * We're at the root of the cgroup2 tree so stop walking
+		 * We're at the root of the cgroup tree so stop walking
 		 * upwards.
-		 * Since we walked up the whole tree we haven't found an actual
-		 * limit anywhere apparently.
-		 *
 		 * Note that we're not checking the root cgroup itself simply
 		 * because a lot of the controllers don't expose files with
 		 * limits to the root cgroup.
 		 */
-		if (same_file(cgroup2_root_fd, dir_fd))
-			return 1;
-
-		/* We found a valid value. Terminate walk. */
-		new_val = readat_file(dir_fd, file);
-		if (!is_empty_string(new_val) && strcmp(new_val, "max") != 0) {
-			*value = move_ptr(new_val);
+		if (same_file(hierarchy_fd, dir_fd)) {
+			*metrics = tmp_metrics;
 			return 0;
 		}
+
+		res = update(dir_fd, usage_file_name, limit_file_name, &tmp_metrics, false);
+		if (res < 0)
+			return res;
 	}
 
 	return log_error_errno(-ELOOP, ELOOP, "To many nested cgroups or invalid mount tree. Terminating walk");

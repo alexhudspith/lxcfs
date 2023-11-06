@@ -241,9 +241,10 @@ __lxcfs_fuse_ops int proc_release(const char *path, struct fuse_file_info *fi)
 
 /**
  * Gets a non-hierarchical memory controller limit, or UINT64_MAX if no limit is
- * in place. If `swap` is true, reads 'swap' (v2) or 'memsw' (v1); otherwise
- * reads the memory (RAM) limits.
- *
+ * in place.
+ * @param cgroup name of cgroup
+ * @param swap request swap (v2)/memsw (v1) limit, not RAM
+ * @param limit output limit set on success, unmodified on failure
  * @returns 0 on success (and sets `*limit`), < 0 on error
  */
 static int get_memlimit(const char *cgroup, bool swap, uint64_t *limit)
@@ -336,9 +337,10 @@ static char *gnu_dirname(char *path)
 
 /**
  * Gets a hierarchical memory controller limit, or UINT64_MAX if no limit is
- * in place. If `swap` is true, reads 'swap' (v2) or 'memsw' (v1); otherwise
- * reads the memory (RAM) limits.
- *
+ * in place. The limit is the minimum of all limits in the cgroup hierarchy.
+ * @param cgroup name of cgroup
+ * @param swap request swap (v2)/memsw (v1) limit, not RAM
+ * @param limit output limit set on success, unmodified on failure
  * @returns 0 on success (and sets `*limit`), < 0 on error
  */
 static int get_min_memlimit(const char *cgroup, bool swap, uint64_t *limit)
